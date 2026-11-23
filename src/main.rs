@@ -2,8 +2,8 @@
 //! ultrasonic pulse into a dedicated output (USB dongle -> isolator -> the sub's RCA input).
 //!
 //! Subcommands:
-//!   (none) / run   tray app: keep-awake engine + system-tray icon
-//!   settings       open the settings window on its own
+//!   (none) / run   keep-awake engine (+ system-tray icon on Windows; daemon on Linux)
+//!   settings       open the settings window (Windows) or print/update config path (Linux)
 //!   pulse          fire one pulse to a device (calibration / test tool)
 //!   list-devices   list output devices
 //!   device-info    a device's sample rates, exclusive-mode support, and current volume
@@ -16,8 +16,11 @@ mod device_guard;
 mod health;
 mod monitor;
 mod scheduler;
+#[cfg(windows)]
 mod settings_ui;
+#[cfg(windows)]
 mod settings_web;
+#[cfg(windows)]
 mod tray;
 mod volume;
 
@@ -48,7 +51,7 @@ enum Command {
         #[arg(long)]
         device: Option<String>,
     },
-    /// Open the settings window directly (without the tray).
+    /// Open the settings window directly (Windows) or print config info (Linux).
     Settings,
     /// Play a calibration pulse (or repeat with --hold).
     Pulse(PulseArgs),
@@ -78,7 +81,7 @@ struct PulseArgs {
     /// Exponential decay time constant in seconds (0 = flat sustain). Gives a chime/bell character.
     #[arg(long, default_value_t = 0.0)]
     decay: f32,
-    /// Use WASAPI exclusive mode (lets us exceed the 24 kHz shared-mode ceiling). Needs --rate.
+    /// Use exclusive / direct rate negotiation mode (lets us exceed a 48 kHz shared-mode ceiling). Needs --rate.
     #[arg(long)]
     exclusive: bool,
     /// Exclusive-mode sample rate in Hz (e.g. 96000, 192000). Max output freq is rate/2.
@@ -163,7 +166,7 @@ fn main() -> Result<()> {
                     Err(e) => println!("    probe failed: {e:#}"),
                 }
                 match volume::get_endpoint_volume_percent(dev) {
-                    Ok(pct) => println!("  current Windows volume: {pct}%"),
+                    Ok(pct) => println!("  current volume: {pct}%"),
                     Err(e) => println!("  volume read failed: {e:#}"),
                 }
             }
@@ -171,12 +174,22 @@ fn main() -> Result<()> {
         }
         Some(Command::Settings) => {
             let cfg = Config::load_or_default()?;
-            // Standalone `settings` has no engine behind it, so its health handle notifies nobody.
-            let health = health::Shared::new(std::sync::Arc::new(|| {}));
-            let shared = std::sync::Arc::new(std::sync::Mutex::new(cfg));
-            // WebView2 window, with the native form as a fallback if it can't start.
-            if !settings_web::open(shared.clone(), health.clone(), false) {
-                settings_ui::open_blocking(shared, health, false);
+            #[cfg(windows)]
+            {
+                // Standalone `settings` has no engine behind it, so its health handle notifies nobody.
+                let health = health::Shared::new(std::sync::Arc::new(|| {}));
+                let shared = std::sync::Arc::new(std::sync::Mutex::new(cfg));
+                // WebView2 window, with the native form as a fallback if it can't start.
+                if !settings_web::open(shared.clone(), health.clone(), false) {
+                    settings_ui::open_blocking(shared, health, false);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let path = Config::path()?;
+                println!("Config file: {}", path.display());
+                println!("(Edit this file directly; changes are hot-reloaded within 2s while `run` is active.)\n");
+                println!("{}", toml::to_string_pretty(&cfg)?);
             }
             Ok(())
         }
@@ -184,7 +197,11 @@ fn main() -> Result<()> {
     }
 }
 
-/// Run the tray app: config + engine thread + system-tray UI (message loop on the main thread).
+/// Run the app:
+/// - Windows: config + engine thread + system-tray UI (message loop on the main thread).
+/// - Linux: headless daemon running the keep-awake engine on the main thread (logs to stdout/stderr
+///   and rolling log file, hot-reloads `config.toml`).
+#[cfg(windows)]
 fn run_app() -> Result<()> {
     let _guard = init_logging();
     let cfg = Config::load_or_default()?;
@@ -229,7 +246,38 @@ fn run_app() -> Result<()> {
     Ok(())
 }
 
-/// File logging under %APPDATA%\T10sKeepAwake\logs (daily rolling). Returns the flush guard.
+#[cfg(not(windows))]
+fn run_app() -> Result<()> {
+    let _guard = init_logging();
+    let cfg = Config::load_or_default()?;
+    if let Ok(path) = Config::path() {
+        tracing::info!(path = %path.display(), ?cfg, "loaded config");
+    } else {
+        tracing::info!(?cfg, "loaded config");
+    }
+
+    if !cfg.output_device.trim().is_empty() {
+        if let Err(e) = volume::set_endpoint_volume_percent(&cfg.output_device, cfg.device_volume_pct) {
+            tracing::debug!(error = %format!("{e:#}"), "initial volume pin skipped");
+        }
+    }
+    if let Err(e) = autostart::set_enabled(cfg.autostart) {
+        tracing::warn!(error = %format!("{e:#}"), "could not sync autostart service");
+    }
+
+    let cfg = Arc::new(Mutex::new(cfg));
+    let stop = Arc::new(AtomicBool::new(false));
+    let health = health::Shared::new(Arc::new(|| {}));
+
+    scheduler::run(cfg, stop, health);
+    Ok(())
+}
+
+/// Logging setup:
+/// - Windows: daily rolling file under `%APPDATA%\T10sKeepAwake\logs`.
+/// - Linux: stderr (for `journalctl --user` / terminal) AND daily rolling file under
+///   `~/.config/T10sKeepAwake/logs`.
+#[cfg(windows)]
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let dir = Config::dir().ok()?.join("logs");
     if std::fs::create_dir_all(&dir).is_err() {
@@ -243,6 +291,25 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .init();
     Some(guard)
 }
+
+#[cfg(not(windows))]
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let dir = Config::dir().ok()?.join("logs");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let file = tracing_appender::rolling::daily(&dir, "t10s.log");
+        let (nb, guard) = tracing_appender::non_blocking(file);
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr.and(nb))
+            .with_ansi(false)
+            .init();
+        Some(guard)
+    } else {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+        None
+    }
+}
+
 
 fn run_pulse(a: PulseArgs) -> Result<()> {
     if a.dbfs > 0.0 {

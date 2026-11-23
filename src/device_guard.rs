@@ -21,12 +21,17 @@
 //! `enforce()` repairs both before a pulse. Everything here is best-effort: a failure is reported,
 //! never fatal, because a degraded pulse attempt is still better than no attempt.
 
+#[cfg(windows)]
 use anyhow::{Result, anyhow};
+#[cfg(windows)]
 use windows::Win32::Media::Audio::{
     PKEY_AudioEngine_DeviceFormat, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
 };
+#[cfg(windows)]
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+#[cfg(windows)]
 use windows::Win32::System::Com::{STGM_WRITE, StructuredStorage::PROPVARIANT};
+#[cfg(windows)]
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 use crate::volume;
@@ -45,6 +50,7 @@ pub fn rate_is_usable(rate: u32, freq_hz: f32) -> bool {
 }
 
 /// How a device measures up for the configured pulse — drives the settings-window readout.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
     /// Runs fast enough for a silent ultrasonic pulse.
@@ -55,6 +61,7 @@ pub enum Capability {
     Unknown { why: String },
 }
 
+#[allow(dead_code)]
 impl Capability {
     /// One-line description shown under the device picker.
     pub fn describe(&self) -> String {
@@ -77,15 +84,19 @@ impl Capability {
 }
 
 /// Classify a device for the configured pulse frequency.
+#[allow(dead_code)]
 pub fn capability(device_name: &str, freq_hz: f32) -> Capability {
     match crate::audio::device_sample_rate_info(Some(device_name)) {
-        Ok((default_rate, max_rate)) => {
-            // The shared stream runs at the *default* rate; the max is what a repair could reach.
-            if rate_is_usable(default_rate, freq_hz) {
-                Capability::Ready { rate: default_rate }
+        Ok((_default_rate, max_rate)) => {
+            #[cfg(windows)]
+            let usable_rate = _default_rate;
+            #[cfg(not(windows))]
+            let usable_rate = max_rate;
+            if rate_is_usable(usable_rate, freq_hz) {
+                Capability::Ready { rate: usable_rate }
             } else {
                 Capability::TooSlow {
-                    rate: default_rate,
+                    rate: usable_rate,
                     needed: required_rate(freq_hz).min(max_rate.max(required_rate(freq_hz))),
                 }
             }
@@ -117,7 +128,7 @@ impl Report {
 ///
 /// Called before each pulse. Never returns Err: problems land in `Report::problems` so one bad
 /// step can't stop the pulse attempt that follows.
-pub fn enforce(device_name: &str, volume_pct: u8, freq_hz: f32, exclusive: bool) -> Report {
+pub fn enforce(device_name: &str, volume_pct: u8, _freq_hz: f32, exclusive: bool) -> Report {
     let mut report = Report::default();
     if device_name.trim().is_empty() {
         return report;
@@ -125,7 +136,12 @@ pub fn enforce(device_name: &str, volume_pct: u8, freq_hz: f32, exclusive: bool)
 
     match volume::set_endpoint_volume_percent(device_name, volume_pct) {
         Ok(()) => report.volume_repinned = true,
-        Err(e) => report.problems.push(format!("volume pin failed: {e:#}")),
+        Err(e) => {
+            #[cfg(windows)]
+            report.problems.push(format!("volume pin failed: {e:#}"));
+            #[cfg(not(windows))]
+            tracing::debug!(device = device_name, error = %format!("{e:#}"), "volume pin skipped (no hardware mixer)");
+        }
     }
 
     // In exclusive mode the pulse negotiates its rate straight with the driver, so the shared
@@ -136,16 +152,17 @@ pub fn enforce(device_name: &str, volume_pct: u8, freq_hz: f32, exclusive: bool)
         return report;
     }
 
+    #[cfg(windows)]
     match crate::audio::device_sample_rate_info(Some(device_name)) {
-        Ok((current, max)) if !rate_is_usable(current, freq_hz) => {
-            let want = pick_repair_rate(max, freq_hz);
+        Ok((current, max)) if !rate_is_usable(current, _freq_hz) => {
+            let want = pick_repair_rate(max, _freq_hz);
             match want {
                 Some(rate) => match set_shared_format_rate(device_name, rate) {
                     // SetValue/Commit returning Ok does NOT mean Windows adopted the format, so
                     // read the endpoint back before claiming anything. Reporting an unverified
                     // "repaired" is worse than reporting a failure: it hides a dead keep-alive.
                     Ok(()) => match crate::audio::device_sample_rate_info(Some(device_name)) {
-                        Ok((now, _)) if rate_is_usable(now, freq_hz) => {
+                        Ok((now, _)) if rate_is_usable(now, _freq_hz) => {
                             report.format_repaired = true;
                             tracing::info!(
                                 device = device_name,
@@ -167,7 +184,7 @@ pub fn enforce(device_name: &str, volume_pct: u8, freq_hz: f32, exclusive: bool)
                         .push(format!("format repair to {rate} Hz failed: {e:#}")),
                 },
                 None => report.problems.push(format!(
-                    "device tops out at {max} Hz, too slow for a {freq_hz:.0} Hz silent pulse"
+                    "device tops out at {max} Hz, too slow for a {_freq_hz:.0} Hz silent pulse"
                 )),
             }
         }
@@ -178,6 +195,7 @@ pub fn enforce(device_name: &str, volume_pct: u8, freq_hz: f32, exclusive: bool)
 }
 
 /// Highest sensible rate to repair to: the device's max, provided it clears Nyquist for `freq_hz`.
+#[allow(dead_code)]
 pub fn pick_repair_rate(max_rate: u32, freq_hz: f32) -> Option<u32> {
     if rate_is_usable(max_rate, freq_hz) {
         Some(max_rate)
@@ -191,6 +209,7 @@ pub fn pick_repair_rate(max_rate: u32, freq_hz: f32) -> Option<u32> {
 ///
 /// This is the `PKEY_AudioEngine_DeviceFormat` property that the audio engine reads when it opens
 /// the shared stream. The value is a VT_BLOB holding a `WAVEFORMATEX`.
+#[cfg(windows)]
 fn set_shared_format_rate(device_name: &str, rate: u32) -> Result<()> {
     let dev = volume::immdevice_by_name(device_name)?;
     let channels: u16 = 2;
@@ -244,6 +263,7 @@ fn set_shared_format_rate(device_name: &str, rate: u32) -> Result<()> {
 /// handing it stack or Rust-heap memory would corrupt the heap when the variant is cleared.
 /// Written through the crate's real union arms rather than a hand-rolled layout mirror, so the
 /// compiler checks the field offsets instead of us hoping we got them right.
+#[cfg(windows)]
 unsafe fn blob_propvariant(bytes: &[u8]) -> Result<PROPVARIANT> {
     use windows::Win32::System::Com::{BLOB, CoTaskMemAlloc};
     use windows::Win32::System::Variant::VT_BLOB;
@@ -309,3 +329,4 @@ mod tests {
         assert!(!slow.is_ready());
     }
 }
+

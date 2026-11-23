@@ -4,6 +4,7 @@
 //! and per-monitor DPI awareness.
 
 fn main() {
+    #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         use embed_manifest::{embed_manifest, new_manifest};
         embed_manifest(new_manifest("T10sKeepAwake"))
@@ -11,3 +12,4 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
 }
+

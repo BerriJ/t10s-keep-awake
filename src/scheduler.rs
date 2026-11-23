@@ -97,6 +97,7 @@ fn fire(cfg: &Config, health: &health::Shared) {
 
 /// Fire one pulse right now, off the engine's schedule — the tray's "Send test pulse" and the
 /// settings window's Test button. Blocks for the pulse duration, so call it on a worker thread.
+#[allow(dead_code)]
 pub fn fire_once(cfg: &Config, health: &health::Shared) {
     fire(cfg, health);
 }

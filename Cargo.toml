@@ -8,15 +8,21 @@ anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 cpal = "0.18.1"
 dirs = "6.0.0"
-# Minimal nwg features only: pulling the default "all" set links comctl32 v6 imports that
-# fail to bind without an app manifest (STATUS_ENTRYPOINT_NOT_FOUND at load). We only need
-# the tray, menu, message window, and cursor — none of which touch comctl32.
-nwg = { package = "native-windows-gui", version = "1.0.13", default-features = false, features = ["tray-notification", "menu", "message-window", "cursor", "image-decoder", "combobox", "notice", "tooltip", "high-dpi", "animation-timer"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.11.0"
+
+[target.'cfg(windows)'.dependencies]
+# Minimal nwg features only: pulling the default "all" set links comctl32 v6 imports that
+# fail to bind without an app manifest (STATUS_ENTRYPOINT_NOT_FOUND at load). We only need
+# the tray, menu, message window, and cursor — none of which touch comctl32.
+nwg = { package = "native-windows-gui", version = "1.0.13", default-features = false, features = ["tray-notification", "menu", "message-window", "cursor", "image-decoder", "combobox", "notice", "tooltip", "high-dpi", "animation-timer"] }
 wasapi = "0.23.0"
 winreg = "0.56.0"
 windows = { version = "0.62", features = [
@@ -27,7 +33,7 @@ windows = { version = "0.62", features = [
 ] }
 wry = "0.55.1"
 tao = "0.35.3"
-serde_json = "1.0.151"
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 embed-manifest = "1.5.0"
+

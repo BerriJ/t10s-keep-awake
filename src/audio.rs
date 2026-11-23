@@ -11,25 +11,66 @@ use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
+/// Format a cpal device for display and matching.
+///
+/// On Windows, `device.to_string()` is the unique WASAPI endpoint friendly name.
+/// On Linux (ALSA), `device.to_string()` only prints the first line of the description (e.g.
+/// `"USB Audio, USB Audio"`), which collides across `hw:`, `plughw:`, `front:`, `iec958:`, etc.
+/// Including the ALSA PCM ID (`id().1` / `description().driver()`) makes each entry unambiguous
+/// (e.g. `"hw:CARD=KA11,DEV=0 — KA11, USB Audio"`) while still matching raw PCM IDs like
+/// `"hw:CARD=KA11,DEV=0"`.
+pub(crate) fn format_device_name(device: &cpal::Device) -> String {
+    #[cfg(windows)]
+    {
+        device.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        let label = device.to_string();
+        if let Ok(id) = device.id() {
+            let pcm_id = id.id();
+            if !pcm_id.is_empty() && pcm_id != label {
+                return format!("{pcm_id} ({label})");
+            }
+        }
+        label
+    }
+}
+
+/// Check whether `device` matches a user-supplied `want` string (exact display name, raw ALSA PCM
+/// ID like `"hw:CARD=KA11,DEV=0"`, or card/description name).
+pub(crate) fn device_matches(device: &cpal::Device, want: &str) -> bool {
+    let want = want.trim();
+    if format_device_name(device) == want || device.to_string() == want {
+        return true;
+    }
+    if let Ok(id) = device.id() {
+        if id.id() == want {
+            return true;
+        }
+    }
+    false
+}
+
 /// Names of all available output devices on the default host.
 pub fn list_output_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let mut names = Vec::new();
     for device in host.output_devices()? {
-        // cpal 0.18: the device name is the Display form (`to_string()`).
-        names.push(device.to_string());
+        names.push(format_device_name(&device));
     }
     Ok(names)
 }
 
-/// Friendly name of Windows' current default output device.
+/// Friendly name of the OS current default output device.
 ///
 /// Used to warn when someone points the keep-awake pulse at the device they actually listen
 /// through — the app manages that device's volume and format, which would wreck normal playback.
+#[allow(dead_code)]
 pub fn default_output_device_name() -> Result<String> {
     let host = cpal::default_host();
     host.default_output_device()
-        .map(|d| d.to_string())
+        .map(|d| format_device_name(&d))
         .ok_or_else(|| anyhow!("no default output device"))
 }
 
@@ -95,8 +136,8 @@ pub(crate) fn sine_sum(freqs: &[f32], n: usize, sr: f32) -> f32 {
     s as f32
 }
 
-/// Resolve an output device by exact name, or the default output if `name` is None.
-fn resolve_output_device(name: Option<&str>) -> Result<cpal::Device> {
+/// Resolve an output device by exact name (or ALSA PCM ID), or the default output if `name` is None.
+pub(crate) fn resolve_output_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
     match name {
         None => host
@@ -104,7 +145,7 @@ fn resolve_output_device(name: Option<&str>) -> Result<cpal::Device> {
             .ok_or_else(|| anyhow!("no default output device")),
         Some(want) => {
             for device in host.output_devices()? {
-                if device.to_string() == want {
+                if device_matches(&device, want) {
                     return Ok(device);
                 }
             }

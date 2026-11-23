@@ -26,6 +26,7 @@ pub struct Health {
     pub next_due: Option<Instant>,
 }
 
+#[allow(dead_code)]
 impl Health {
     pub fn is_failing(&self) -> bool {
         self.last_error.is_some()
@@ -90,6 +91,7 @@ pub struct Shared {
     on_change: Arc<dyn Fn() + Send + Sync>,
 }
 
+#[allow(dead_code)]
 impl Shared {
     pub fn new(on_change: Arc<dyn Fn() + Send + Sync>) -> Self {
         Shared {

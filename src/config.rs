@@ -69,10 +69,15 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        #[cfg(windows)]
+        let default_device = "Headphones (FIIO KA11)".to_string();
+        #[cfg(not(windows))]
+        let default_device = "hw:CARD=KA11,DEV=0".to_string();
+
         Config {
             enabled: true,
             mode: Mode::AlwaysOn, // silent ultrasonic winner needs no silence-gating; simplest + correct
-            output_device: "Headphones (FIIO KA11)".to_string(),
+            output_device: default_device,
             monitor_device: None,
             // Measured standby timer is ~16 min (not the long-assumed 17.5), so 12 leaves ~4 min.
             interval_min: 12.0,
@@ -80,8 +85,7 @@ impl Default for Config {
             freqs: vec![],
             decay_s: 0.0,
             // Exclusive mode: the pulse negotiates its rate straight with the driver, so it is
-            // immune to Windows changing the endpoint's shared "Default Format" (which cannot be
-            // reliably changed back from user space — the property write is accepted and ignored).
+            // immune to the OS changing the endpoint's shared "Default Format".
             // Blocking the device is fine here precisely because it is dedicated to the pulse.
             exclusive: true,
             sample_rate: 384_000,

@@ -2294,6 +2294,7 @@ dependencies = [
 name = "t10s_keep_awake"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "anyhow",
  "clap",
  "cpal",

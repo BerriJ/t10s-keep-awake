@@ -4,7 +4,8 @@
 switch. After ~16 min of "no signal" it sleeps, and since it houses the crossover, it drags the
 T-series monitors down with it (waking takes seconds and pops). Their only advice is "run it hot."
 
-This is a tiny Windows system-tray utility that keeps it awake instead. The T10S takes both
+This is a tiny utility (system-tray app on Windows, headless daemon / systemd user service on Linux)
+that keeps it awake instead. The T10S takes both
 **balanced (XLR) and unbalanced (RCA) input and sums them** — so if your listening path runs into
 the balanced inputs, the unbalanced pair is free. The utility fires a brief, configurable keep-alive
 pulse into it on a **dedicated USB audio device of its own**, at a fixed, knob-independent level.
@@ -42,28 +43,26 @@ isn't code-signed. Build it yourself if you'd rather not take that on trust.
 ```
 cargo build --release
 ```
-Release binaries link the CRT statically, which is not the cargo default:
-```
-set RUSTFLAGS=-C target-feature=+crt-static
-cargo build --release
-```
+On Linux, `alsa-lib` (`libasound2-dev` / `alsa-lib-devel`) and `pkg-config` are required to build.
+On Windows, release binaries link the CRT statically via `.cargo/config.toml`.
 
 ## Run
 ```
-t10s_keep_awake.exe run     # tray app: keep-awake engine + system-tray icon (or just double-click)
-t10s_keep_awake.exe         # same (run is the default)
+t10s_keep_awake run     # Windows: tray app + engine; Linux: headless keep-awake daemon
+t10s_keep_awake         # same (run is the default)
 ```
-Right-click the tray icon for **Enabled / Disabled** (a checkmark shows which is active),
+On **Windows**, right-click the tray icon for **Enabled / Disabled** (a checkmark shows which is active),
 **Send Test Pulse**, **Configure…** and **Quit**. The icon turns amber and raises a notification if
-a pulse ever fails, so a broken keep-alive can't go unnoticed. A pulse fires immediately on start
-and whenever you re-enable it, then every `interval-min` minutes.
+a pulse ever fails, so a broken keep-alive can't go unnoticed.
+On **Linux**, `t10s_keep_awake run` runs as a lightweight headless daemon logging to stderr (for `journalctl --user`) and `~/.config/T10sKeepAwake/logs/`.
+A pulse fires immediately on start and whenever you re-enable it, then every `interval-min` minutes.
 
 Other subcommands:
 ```
-t10s_keep_awake.exe list-devices                         # list output devices
-t10s_keep_awake.exe device-info --device "<name>"        # sample-rate + exclusive support + current volume
-t10s_keep_awake.exe settings                             # open the settings window without the tray
-t10s_keep_awake.exe pulse --device "<name>" --freqs 50,250,500 --db=-38 --dur 0.5   # fire one pulse (test tool)
+t10s_keep_awake list-devices                         # list output devices
+t10s_keep_awake device-info --device "<name>"        # sample-rate + exclusive support + current volume
+t10s_keep_awake settings                             # Windows: settings window; Linux: print config path & TOML
+t10s_keep_awake pulse --device "<name>" --freqs 50,250,500 --db=-38 --dur 0.5   # fire one pulse (test tool)
 ```
 
 ## Configure
@@ -77,11 +76,16 @@ deliberately exposes only what you should change:
 | **Interval** | 10–14 minutes between pulses (12 recommended; the sub sleeps after ~16 min) |
 | **Start with Windows** | autostart via the `HKCU\...\Run` key |
 
-Everything else stays in `%APPDATA%\T10sKeepAwake\config.toml` at its locked value — `freq-hz`,
+Everything else stays in `%APPDATA%\T10sKeepAwake\config.toml` (Windows) or
+`~/.config/T10sKeepAwake/config.toml` (Linux) at its locked value — `freq-hz`,
 `level-dbfs`, `duration-s`, `fade-ms`, `freqs`/`decay-s` (the audible chord/chime fallbacks),
 `exclusive`/`sample-rate`, `device-volume-pct`, `mode`/`monitor-device`/`silence-threshold-dbfs`.
 Edits to that file are picked up within ~2 s, no restart needed. All values are clamped on load,
 and `level-dbfs` can never exceed −12 dBFS.
+
+On Linux, choose a direct ALSA hardware device (e.g. `hw:CARD=KA11,DEV=0` or `plughw:CARD=KA11,DEV=0`
+from `list-devices`) as `output-device` so the daemon can negotiate a ≥ 96 kHz sample rate directly
+with the DAC without resampling through the desktop audio server.
 
 ## Safety
 `level-dbfs` is hard-clamped to **−12 dBFS** in code (`MAX_LEVEL_DBFS`) and the dongle volume is
@@ -113,14 +117,15 @@ shared mode rather than skipping the pulse.
 > endpoint a 30 kHz pulse would fold to an audible 18 kHz. It never guesses.
 
 ## Autostart
-Toggle in the settings window (or set `autostart = true`). Managed via the `HKCU\...\Run` key.
+Toggle in the settings window (or set `autostart = true` in `config.toml`).
+- **Windows:** managed via the `HKCU\...\Run` registry key.
+- **Linux:** installs and enables a systemd user unit at `~/.config/systemd/user/t10s-keep-awake.service`.
 
 ## Platform support
-Windows only for now, but the pulse math and scheduler are platform-agnostic — only the audio-device,
-tray, and volume layers are Windows-specific. **macOS / Linux backends are welcome** from anyone who
-can test on the hardware; [`docs/PORTABILITY.md`](docs/PORTABILITY.md) maps exactly which files are
-portable vs. platform-specific and where a new backend plugs in. (Note: the ultrasonic hi-res output
-is actually *simpler* on macOS CoreAudio than on Windows WASAPI.)
+Supports **Windows** (system-tray app + WebView2/native settings UI + WASAPI exclusive/shared output)
+and **Linux** (headless daemon + CLI + ALSA / PipeWire / PulseAudio output and mixer volume control).
+**macOS backends are welcome** from anyone who can test on the hardware;
+[`docs/PORTABILITY.md`](docs/PORTABILITY.md) maps which files are portable vs. platform-specific.
 
 The keep-alive approach applies to any **Adam Audio T-series** monitor paired with the T10S — the T5V/T7V/
 T8V share the same U-ART tweeter and all cap at 25 kHz, so a >25 kHz pulse is silent on all of them.

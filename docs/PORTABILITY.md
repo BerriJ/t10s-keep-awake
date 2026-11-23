@@ -1,28 +1,25 @@
 # Portability / platform boundary
 
-The app currently targets **Windows only**, but the core logic is platform-agnostic and the
-OS-specific parts are isolated to a handful of files. This doc maps that boundary so a **macOS or
-Linux backend can be contributed** without touching the portable core.
-
-> **macOS / Linux PRs welcome** — from someone who can *test on the hardware*. The pulse math is
-> portable; the audio-device and UI layers must be verified on the real platform, not built blind.
+The app targets **Windows** and **Linux**, with the core logic platform-agnostic and OS-specific
+parts isolated via `#[cfg(windows)]` / `#[cfg(target_os = "linux")]`. This doc maps that boundary so
+a **macOS backend can be contributed** without touching the portable core.
 
 ## Module map
 
-| File | Portable? | What it does / what a non-Windows backend needs |
-|---|---|---|
-| `config.rs` | ✅ portable | serde/toml config + clamps. No OS calls. Unit-tested. |
-| `scheduler.rs` | ✅ mostly | engine loop + mode dispatch; only its calls into the platform modules below are OS-specific. |
-| `monitor.rs` | ◐ split | `rms_dbfs` + `SilenceGate` are pure/portable (unit-tested). `LoopbackMeter` is **WASAPI loopback** — needs a CoreAudio (macOS) / PulseAudio-monitor (Linux) equivalent. |
-| `audio.rs` | ✅ portable | shared-mode pulse render via **cpal**, which is already cross-platform (CoreAudio / ALSA). Should build and work as-is on macOS/Linux. |
-| `audio_exclusive.rs` | ❌ Windows | **WASAPI exclusive** for >24 kHz (ultrasonic) output. See note below — this is *easier* on macOS. |
-| `volume.rs` | ❌ Windows | pins device volume via `IAudioEndpointVolume`. macOS: CoreAudio `kAudioHardwareServiceDeviceProperty_VirtualMainVolume`; Linux: `pactl`/ALSA. Non-fatal — a stub that no-ops is acceptable. |
-| `tray.rs` | ❌ Windows | system-tray + menu via **nwg**. macOS: a menu-bar (NSStatusItem) app; Linux: a StatusNotifierItem. A cross-platform tray crate (`tray-icon` + `tao`) could replace nwg for all three. |
-| `settings_web.rs` | ◐ split | settings window as a local HTML page via **wry**/WebView2. `wry` and `tao` are already cross-platform (WKWebView on macOS, WebKitGTK on Linux); only `with_any_thread` is Windows-specific. The page in `assets/settings.html` is portable as-is. |
-| `settings_ui.rs` | ❌ Windows | fallback settings window in native nwg controls, used only when WebView2 is missing. A non-Windows port can simply omit it. |
-| `device_guard.rs` | ❌ Windows | holds the dedicated device's volume, and (shared-mode only) attempts a format repair. macOS: setting `kAudioDevicePropertyNominalSampleRate` actually *works*, unlike the Windows property write — see RESEARCH.md. |
-| `health.rs` | ✅ portable | engine status shared with the UI. No OS calls. Unit-tested. |
-| `autostart.rs` | ❌ Windows | HKCU `Run` key. macOS: a `LaunchAgent` plist in `~/Library/LaunchAgents`; Linux: a `.desktop` autostart entry or systemd user unit. |
+| File | Portable? | Windows | Linux |
+|---|---|---|---|
+| `config.rs` | ✅ portable | `%APPDATA%\T10sKeepAwake\config.toml` | `~/.config/T10sKeepAwake/config.toml` |
+| `scheduler.rs` | ✅ portable | engine loop + mode dispatch | engine loop + mode dispatch |
+| `monitor.rs` | ✅ cross-platform | WASAPI loopback (`LoopbackMeter`) | `cpal` input/monitor stream (`LoopbackMeter`) |
+| `audio.rs` | ✅ portable | shared-mode pulse render via `cpal` | shared-mode pulse render via `cpal` |
+| `audio_exclusive.rs` | ✅ cross-platform | WASAPI exclusive for >24 kHz output | Direct ALSA / `cpal` stream negotiated at `sample_rate` |
+| `volume.rs` | ✅ cross-platform | `IAudioEndpointVolume` | ALSA hardware mixer (`alsa::mixer`) + `pactl` fallback |
+| `device_guard.rs` | ✅ cross-platform | volume pin + `PKEY_AudioEngine_DeviceFormat` repair | volume pin + capability check |
+| `health.rs` | ✅ portable | engine status shared with UI | engine status tracking |
+| `autostart.rs` | ✅ cross-platform | HKCU `Run` key | `~/.config/systemd/user/t10s-keep-awake.service` |
+| `tray.rs` | 🪟 Windows | system-tray + menu via `nwg` | omitted (headless daemon on Linux) |
+| `settings_web.rs` | 🪟 Windows | settings window via `wry`/WebView2 | omitted (`settings` subcommand prints config path & TOML) |
+| `settings_ui.rs` | 🪟 Windows | fallback settings window in native `nwg` | omitted |
 
 ## The ultrasonic pulse is *easier* on macOS
 The Windows path needs WASAPI **exclusive mode** to escape the 48 kHz shared mix format and emit
