@@ -250,8 +250,43 @@ mod imp {
     use cpal::traits::{DeviceTrait, StreamTrait};
     use cpal::{FromSample, SampleFormat, SizedSample};
 
+    /// If `device_name` is a `plughw:` device, query the corresponding raw `hw:` device to find
+    /// the physical DAC's true maximum sample rate (since `plughw:` reports `u32::MAX` via software
+    /// resampling).
+    fn probe_real_hw_max_rate(device_name: &str) -> Option<u32> {
+        let s = device_name.trim();
+        let hw_name = s.strip_prefix("plughw:").map(|rest| format!("hw:{rest}"))?;
+        let (_, max_sr) = crate::audio::device_sample_rate_info(Some(&hw_name)).ok()?;
+        if max_sr > 0 && max_sr <= 768_000 {
+            Some(max_sr)
+        } else {
+            None
+        }
+    }
+
     fn resolve_device(name: &str) -> Result<cpal::Device> {
         crate::audio::resolve_output_device(Some(name))
+    }
+
+    /// Score a format + channel configuration so we pick a high-quality stereo stream (F32 > I32 >
+    /// I24 > I16 > U16, 2 channels preferred) instead of `I8` 1-channel which ALSA `plughw` lists
+    /// first.
+    fn format_rank(r: &cpal::SupportedStreamConfigRange) -> Option<u32> {
+        let fmt_score = match r.sample_format() {
+            SampleFormat::F32 => 50,
+            SampleFormat::F64 => 45,
+            SampleFormat::I32 => 40,
+            SampleFormat::I24 => 30,
+            SampleFormat::I16 => 20,
+            SampleFormat::U16 => 10,
+            _ => return None, // reject I8/U8/DSD etc.
+        };
+        let ch_score = match r.channels() {
+            2 => 5,
+            1 => 3,
+            _ => 1,
+        };
+        Some(fmt_score + ch_score)
     }
 
     /// Probe which sample rates the device accepts on Linux (via ALSA/cpal supported output configs).
@@ -265,7 +300,10 @@ mod imp {
         for &rate in rates {
             let matching = configs
                 .iter()
-                .find(|r| r.min_sample_rate() <= rate && rate <= r.max_sample_rate());
+                .filter(|r| r.min_sample_rate() <= rate && rate <= r.max_sample_rate())
+                .filter_map(|r| format_rank(r).map(|score| (score, r)))
+                .max_by_key(|(score, _)| *score)
+                .map(|(_, r)| r);
             match matching {
                 Some(r) => out.push(format!(
                     "{rate:>7} Hz: OK ({:?}, {} ch)   max output {} Hz",
@@ -303,34 +341,62 @@ mod imp {
             .context("querying supported output configs")?
             .collect();
 
-        // 1. Prefer the exact requested sample_rate if supported.
-        // 2. Otherwise fall back to the highest supported rate on the device that clears Nyquist.
+        // Cap sample_rate to the underlying hardware's real maximum if the user selected `plughw:`
+        // (which advertises u32::MAX via software resampling). Resampling 384 kHz down to 48 kHz in
+        // software would strip a 30 kHz ultrasonic pulse.
+        let effective_target_rate = if let Some(hw_max) = probe_real_hw_max_rate(device_name) {
+            sample_rate.min(hw_max)
+        } else {
+            sample_rate
+        };
+
+        // 1. Prefer `effective_target_rate` if supported, choosing the highest-ranked
+        //    sample format (F32 > I32 > I24 > I16 > U16, 2 ch preferred).
+        // 2. Otherwise fall back to the highest supported real hardware rate that clears Nyquist.
         let chosen = ranges
             .iter()
-            .find(|r| r.min_sample_rate() <= sample_rate && sample_rate <= r.max_sample_rate())
-            .map(|r| r.with_sample_rate(sample_rate))
+            .filter(|r| {
+                r.min_sample_rate() <= effective_target_rate
+                    && effective_target_rate <= r.max_sample_rate()
+            })
+            .filter_map(|r| format_rank(r).map(|score| (score, r)))
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, r)| r.with_sample_rate(effective_target_rate))
             .or_else(|| {
                 ranges
                     .iter()
-                    .filter(|r| r.max_sample_rate() >= min_needed)
-                    .max_by_key(|r| r.max_sample_rate())
-                    .map(|r| r.with_max_sample_rate())
+                    .filter(|r| r.max_sample_rate() >= min_needed && r.max_sample_rate() <= 768_000)
+                    .filter_map(|r| format_rank(r).map(|score| ((r.max_sample_rate(), score), r)))
+                    .max_by_key(|(key, _)| *key)
+                    .map(|(_, r)| r.with_max_sample_rate())
             })
             .ok_or_else(|| {
                 anyhow!(
-                    "no supported output format at {sample_rate} Hz (or >= {min_needed} Hz) on {device_name:?}"
+                    "no supported output format at {effective_target_rate} Hz (or >= {min_needed} Hz) on {device_name:?}"
                 )
             })?;
 
         let sample_format = chosen.sample_format();
-        let config: cpal::StreamConfig = chosen.into();
+        let mut config: cpal::StreamConfig = chosen.into();
+        // When opening the `pipewire` or `default` ALSA plugin at >= 96 kHz, cpal's
+        // `BufferSize::Default` causes the PipeWire-ALSA plugin to allocate a 1M-frame ring buffer
+        // (~5+ seconds of startup/drain latency), which truncates or delays a 5 s pulse. Requesting
+        // a 2048-frame buffer (~21 ms at 96 kHz) makes PipeWire play and drain immediately.
+        if matches!(device_name.trim(), "pipewire" | "default")
+            || device_name.starts_with("pipewire ")
+            || device_name.starts_with("default ")
+        {
+            config.buffer_size = cpal::BufferSize::Fixed(2048);
+        }
         crate::audio::check_nyquist(freqs, config.sample_rate as f32)?;
 
         let amp = dbfs_to_amp(dbfs);
         let f = freqs.to_vec();
         match sample_format {
             SampleFormat::F32 => run_stream::<f32>(&device, config, f, amp, dur_secs, fade_ms),
+            SampleFormat::F64 => run_stream::<f64>(&device, config, f, amp, dur_secs, fade_ms),
             SampleFormat::I32 => run_stream::<i32>(&device, config, f, amp, dur_secs, fade_ms),
+            SampleFormat::I24 => run_stream::<cpal::I24>(&device, config, f, amp, dur_secs, fade_ms),
             SampleFormat::I16 => run_stream::<i16>(&device, config, f, amp, dur_secs, fade_ms),
             SampleFormat::U16 => run_stream::<u16>(&device, config, f, amp, dur_secs, fade_ms),
             other => bail!("unsupported sample format: {other:?}"),

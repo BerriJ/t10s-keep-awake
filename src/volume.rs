@@ -77,25 +77,39 @@ mod imp {
     use anyhow::{Context, Result, anyhow, bail};
     use alsa::mixer::{Mixer, SelemChannelId, SelemId};
 
-    /// Extract the ALSA card control identifier (e.g. `"hw:CARD=KA11"` or `"hw:1"`) from a cpal
-    /// ALSA device name such as `"hw:CARD=KA11,DEV=0 (KA11, USB Audio)"`, `"hw:CARD=3,DEV=0"`,
-    /// `"iec958:CARD=KA11,DEV=0"`, or `"hw:1,0"`.
+    /// Extract the ALSA card control identifier (e.g. `"hw:3"`) from a cpal ALSA device name such
+    /// as `"hw:CARD=KA11,DEV=0 (KA11, USB Audio)"`, `"hw:CARD=3,DEV=0"`, `"iec958:CARD=KA11,DEV=0"`,
+    /// or `"hw:1,0"`.
+    ///
+    /// Resolves card names (like `KA11` or `K2`) via `alsa::card::Iter` first so that opening the
+    /// mixer for a non-existent card never triggers libasound's noisy stderr error
+    /// (`ALSA lib confmisc.c:165:(snd_config_get_card) Cannot get card index for ...`).
     pub(crate) fn alsa_card_ctl_name(device_name: &str) -> Option<String> {
+        let card = extract_card_token(device_name)?;
+        if card.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("hw:{card}"));
+        }
+        // Resolve symbolic card ID to numeric card index without invoking snd_config_get_card on
+        // a missing card.
+        if let Some(idx) = crate::audio::resolve_alsa_card_index(&card) {
+            return Some(format!("hw:{idx}"));
+        }
+        None
+    }
+
+    pub(crate) fn extract_card_token(device_name: &str) -> Option<String> {
         let s = device_name.trim();
         if let Some(pos) = s.find("CARD=") {
             let after = &s[pos + 5..];
             let card = after.split(&[',', ' ', ';', ')'][..]).next()?.trim();
             if !card.is_empty() {
-                if card.chars().all(|c| c.is_ascii_digit()) {
-                    return Some(format!("hw:{card}"));
-                }
-                return Some(format!("hw:CARD={card}"));
+                return Some(card.to_string());
             }
         }
         if let Some(rest) = s.strip_prefix("hw:").or_else(|| s.strip_prefix("plughw:")) {
             let card = rest.split(&[',', ' '][..]).next()?.trim();
             if !card.is_empty() && card.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Some(format!("hw:{card}"));
+                return Some(card.to_string());
             }
         }
         None
@@ -117,6 +131,9 @@ mod imp {
 
     /// Set the ALSA hardware mixer playback volume (or PipeWire/PulseAudio sink volume) to `percent`%.
     pub fn set_endpoint_volume_percent(device_name: &str, percent: u8) -> Result<()> {
+        if percent == 0 {
+            return Ok(());
+        }
         let pct = percent.min(100);
         let mut any_ok = false;
         let mut last_err = None;
@@ -139,6 +156,64 @@ mod imp {
         }
     }
 
+    /// Convert a Windows-style scalar percentage (0..=100) to an ALSA mixer step between `min`
+    /// and `max`, using the element's dB scale (`get_playback_vol_db_range` / `ask_Playback_dB_to_vol`)
+    /// when available.
+    ///
+    /// Why this matters: Windows `IAudioEndpointVolume::SetMasterVolumeLevelScalar(0.25)` uses a
+    /// perceptual curve where 25% scalar is roughly −12 to −20 dB. By contrast, ALSA's raw integer
+    /// mixer steps (`min..=max`) are logarithmic in dB — on USB audio cards with a −65 dB..0 dB
+    /// range (or −127 dB..0 dB on Komplete Audio 2), setting 25% of the raw integer range results
+    /// in **−48.75 dB** (or **−95 dB**!), which attenuates the keep-awake pulse by 30–75 dB more
+    /// than on Windows so the subwoofer never detects it.
+    ///
+    /// Using the cubic perceptual mapping `amplitude = (pct / 100)^1.5` (where 25% -> −18 dB,
+    /// 50% -> −9 dB, 100% -> 0 dB) matches the Windows scalar volume behavior when mapped through
+    /// ALSA's dB table.
+    fn percent_to_alsa_volume(selem: &alsa::mixer::Selem, pct: u8) -> i64 {
+        let (min, max) = selem.get_playback_volume_range();
+        if pct == 0 {
+            return min;
+        }
+        if pct >= 100 {
+            return max;
+        }
+        let (db_min, db_max) = selem.get_playback_db_range();
+        if db_max > db_min {
+            // Perceptual scalar-to-dB curve matching Windows endpoint volume scalar (~ -18 dB at 25%)
+            let scalar = (pct as f64) / 100.0;
+            let target_db_rel = 30.0 * scalar.log10(); // millibels: * 100
+            let target_mb = (db_max.0 as f64 + target_db_rel * 100.0)
+                .round()
+                .clamp(db_min.0 as f64, db_max.0 as f64) as i64;
+            if let Ok(vol) = selem.ask_playback_db_vol(alsa::mixer::MilliBel(target_mb), alsa::Round::Floor) {
+                return vol.clamp(min, max);
+            }
+        }
+        min + (((max - min) as f64 * (pct as f64 / 100.0)).round() as i64)
+    }
+
+    fn alsa_volume_to_percent(selem: &alsa::mixer::Selem, vol: i64) -> u8 {
+        let (min, max) = selem.get_playback_volume_range();
+        if max <= min || vol <= min {
+            return 0;
+        }
+        if vol >= max {
+            return 100;
+        }
+        let (db_min, db_max) = selem.get_playback_db_range();
+        if db_max > db_min {
+            if let Ok(mb) = selem.ask_playback_vol_db(vol) {
+                let db_rel = (mb.0 - db_max.0) as f64 / 100.0; // <= 0 dB
+                let scalar = 10f64.powf(db_rel / 30.0);
+                return (scalar * 100.0).round().clamp(0.0, 100.0) as u8;
+            }
+        }
+        (((vol - min) as f64 / (max - min) as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    }
+
     fn get_alsa_mixer_volume(ctl: &str) -> Result<u8> {
         let mixer = Mixer::new(ctl, false).with_context(|| format!("opening ALSA mixer {ctl}"))?;
         for name in ["PCM", "Master", "Speaker", "Headphone", "Digital"] {
@@ -150,10 +225,7 @@ mod imp {
                         let v = selem
                             .get_playback_volume(SelemChannelId::FrontLeft)
                             .with_context(|| format!("reading {name} volume on {ctl}"))?;
-                        let pct = (((v - min) as f64 / (max - min) as f64) * 100.0)
-                            .round()
-                            .clamp(0.0, 100.0) as u8;
-                        return Ok(pct);
+                        return Ok(alsa_volume_to_percent(&selem, v));
                     }
                 }
             }
@@ -165,10 +237,7 @@ mod imp {
                     let (min, max) = selem.get_playback_volume_range();
                     if max > min {
                         let v = selem.get_playback_volume(SelemChannelId::FrontLeft)?;
-                        let pct = (((v - min) as f64 / (max - min) as f64) * 100.0)
-                            .round()
-                            .clamp(0.0, 100.0) as u8;
-                        return Ok(pct);
+                        return Ok(alsa_volume_to_percent(&selem, v));
                     }
                 }
             }
@@ -184,7 +253,7 @@ mod imp {
                 if selem.has_playback_volume() {
                     let (min, max) = selem.get_playback_volume_range();
                     if max > min {
-                        let target = min + (((max - min) as f64 * (pct as f64 / 100.0)).round() as i64);
+                        let target = percent_to_alsa_volume(&selem, pct);
                         let _ = selem.set_playback_volume_all(target);
                         if selem.has_playback_switch() {
                             let _ = selem.set_playback_switch_all(1);
@@ -256,20 +325,20 @@ mod imp {
         #[test]
         fn extracts_alsa_card_from_cpal_device_strings() {
             assert_eq!(
-                alsa_card_ctl_name("hw:CARD=KA11,DEV=0").as_deref(),
-                Some("hw:CARD=KA11")
+                extract_card_token("hw:CARD=KA11,DEV=0").as_deref(),
+                Some("KA11")
             );
             assert_eq!(
                 alsa_card_ctl_name("hw:CARD=3,DEV=0 (Komplete Audio 2, USB Audio)").as_deref(),
                 Some("hw:3")
             );
             assert_eq!(
-                alsa_card_ctl_name("plughw:CARD=Dongle,DEV=0").as_deref(),
-                Some("hw:CARD=Dongle")
+                extract_card_token("plughw:CARD=Dongle,DEV=0").as_deref(),
+                Some("Dongle")
             );
             assert_eq!(
-                alsa_card_ctl_name("iec958:CARD=PCH,DEV=0").as_deref(),
-                Some("hw:CARD=PCH")
+                extract_card_token("iec958:CARD=PCH,DEV=0").as_deref(),
+                Some("PCH")
             );
             assert_eq!(alsa_card_ctl_name("hw:1,0").as_deref(), Some("hw:1"));
             assert_eq!(alsa_card_ctl_name("default"), None);

@@ -59,7 +59,9 @@ pub struct Config {
     pub duration_s: f32,
     /// Raised-cosine fade in/out, milliseconds (anti-click).
     pub fade_ms: f32,
-    /// Windows volume (%) the app holds the output device at; re-applied while running.
+    /// Windows/Linux volume (%) the app holds the output device at; re-applied while running.
+    /// Set to `0` to leave the device's system volume untouched (required when sharing the main
+    /// listening interface rather than a dedicated keep-awake dongle).
     pub device_volume_pct: u8,
     /// `audio-sensing`: RMS level (dBFS) below which the monitor path counts as "silent".
     pub silence_threshold_dbfs: f32,
@@ -72,7 +74,17 @@ impl Default for Config {
         #[cfg(windows)]
         let default_device = "Headphones (FIIO KA11)".to_string();
         #[cfg(not(windows))]
-        let default_device = "hw:CARD=KA11,DEV=0".to_string();
+        let default_device = "pipewire".to_string();
+
+        #[cfg(windows)]
+        let default_rate = 384_000;
+        #[cfg(not(windows))]
+        let default_rate = 96_000;
+
+        #[cfg(windows)]
+        let default_vol = 25;
+        #[cfg(not(windows))]
+        let default_vol = 0;
 
         Config {
             enabled: true,
@@ -88,12 +100,12 @@ impl Default for Config {
             // immune to the OS changing the endpoint's shared "Default Format".
             // Blocking the device is fine here precisely because it is dedicated to the pulse.
             exclusive: true,
-            sample_rate: 384_000,
+            sample_rate: default_rate,
             level_dbfs: MAX_LEVEL_DBFS, // -12: inaudible even at the safety-clamp maximum
             // 2 s already saturates the timer; 5 s is free margin because nothing is audible.
             duration_s: 5.0,
             fade_ms: 15.0,
-            device_volume_pct: 25,
+            device_volume_pct: default_vol,
             silence_threshold_dbfs: -50.0,
             autostart: false,
         }

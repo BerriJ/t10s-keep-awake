@@ -121,6 +121,13 @@ fn reload_config_from_disk(cfg: &Arc<Mutex<Config>>) {
     let changed = cur.enabled != on_disk.enabled
         || cur.interval_min != on_disk.interval_min
         || cur.output_device != on_disk.output_device
+        || cur.device_volume_pct != on_disk.device_volume_pct
+        || cur.freq_hz != on_disk.freq_hz
+        || cur.freqs != on_disk.freqs
+        || cur.level_dbfs != on_disk.level_dbfs
+        || cur.duration_s != on_disk.duration_s
+        || cur.exclusive != on_disk.exclusive
+        || cur.sample_rate != on_disk.sample_rate
         || cur.autostart != on_disk.autostart;
     if changed {
         tracing::info!(

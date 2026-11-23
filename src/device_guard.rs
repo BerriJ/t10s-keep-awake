@@ -134,14 +134,29 @@ pub fn enforce(device_name: &str, volume_pct: u8, _freq_hz: f32, exclusive: bool
         return report;
     }
 
-    match volume::set_endpoint_volume_percent(device_name, volume_pct) {
-        Ok(()) => report.volume_repinned = true,
-        Err(e) => {
-            #[cfg(windows)]
-            report.problems.push(format!("volume pin failed: {e:#}"));
-            #[cfg(not(windows))]
-            tracing::debug!(device = device_name, error = %format!("{e:#}"), "volume pin skipped (no hardware mixer)");
+    if volume_pct > 0 {
+        match volume::set_endpoint_volume_percent(device_name, volume_pct) {
+            Ok(()) => report.volume_repinned = true,
+            Err(e) => {
+                #[cfg(windows)]
+                report.problems.push(format!("volume pin failed: {e:#}"));
+                #[cfg(not(windows))]
+                tracing::debug!(device = device_name, error = %format!("{e:#}"), "volume pin skipped");
+            }
         }
+    }
+
+    // On Linux, if the pulse is routed through PipeWire (`pipewire` or `default`) and needs an
+    // ultrasonic rate (> 24 kHz -> >= 96 kHz), ensure PipeWire's runtime `clock.allowed-rates`
+    // includes 96000 and 192000 Hz so PipeWire switches the hardware DAC to hi-res rather than
+    // resampling the 30 kHz pulse down to 48 kHz (which would strip the ultrasonic frequency).
+    #[cfg(target_os = "linux")]
+    if _freq_hz >= 24_000.0
+        && (matches!(device_name.trim(), "pipewire" | "default")
+            || device_name.starts_with("pipewire ")
+            || device_name.starts_with("default "))
+    {
+        ensure_pipewire_hi_res_clock();
     }
 
     // In exclusive mode the pulse negotiates its rate straight with the driver, so the shared
@@ -202,6 +217,37 @@ pub fn pick_repair_rate(max_rate: u32, freq_hz: f32) -> Option<u32> {
     } else {
         None
     }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_pipewire_hi_res_clock() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if let Ok(out) = std::process::Command::new("pw-metadata")
+            .args(["-n", "settings", "0", "clock.allowed-rates"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if !text.contains("96000") && !text.contains("192000") {
+                if std::process::Command::new("pw-metadata")
+                    .args([
+                        "-n",
+                        "settings",
+                        "0",
+                        "clock.allowed-rates",
+                        "[ 44100 48000 88200 96000 176400 192000 ]",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+                {
+                    tracing::info!("enabled PipeWire hi-res clock.allowed-rates (up to 192 kHz)");
+                }
+            }
+        }
+    });
 }
 
 /// Rewrite the endpoint's shared-mode format (what the Sound control panel calls "Default Format")

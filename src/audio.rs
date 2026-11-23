@@ -38,18 +38,91 @@ pub(crate) fn format_device_name(device: &cpal::Device) -> String {
 }
 
 /// Check whether `device` matches a user-supplied `want` string (exact display name, raw ALSA PCM
-/// ID like `"hw:CARD=KA11,DEV=0"`, or card/description name).
+/// ID like `"hw:CARD=KA11,DEV=0"`, card name like `"hw:CARD=K2,DEV=0"` matching `hw:CARD=3,DEV=0`,
+/// or card/description name).
 pub(crate) fn device_matches(device: &cpal::Device, want: &str) -> bool {
     let want = want.trim();
     if format_device_name(device) == want || device.to_string() == want {
         return true;
     }
     if let Ok(id) = device.id() {
-        if id.id() == want {
+        let pcm_id = id.id();
+        if pcm_id == want {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        if alsa_pcm_id_matches(pcm_id, want) {
             return true;
         }
     }
     false
+}
+
+/// On Linux, cpal enumerates `hw:` and `plughw:` devices using numeric card indices (e.g.
+/// `hw:CARD=3,DEV=0`), whereas `sysdefault:`/`front:` use the card ID string (e.g. `CARD=K2`) and
+/// users often write `hw:CARD=K2,DEV=0` or `hw:3,0`. Resolve the card ID string to its numeric
+/// index via ALSA so `hw:CARD=K2,DEV=0`, `hw:CARD=3,DEV=0`, and `hw:3,0` all match the same device.
+#[cfg(target_os = "linux")]
+fn alsa_pcm_id_matches(device_pcm_id: &str, want: &str) -> bool {
+    let Some((d_prefix, d_card, d_dev)) = parse_alsa_hw_spec(device_pcm_id) else {
+        return false;
+    };
+    // Strip any trailing description like "hw:CARD=3,DEV=0 (Komplete Audio 2, USB Audio)"
+    let want_id = want.split_whitespace().next().unwrap_or(want);
+    let Some((w_prefix, w_card, w_dev)) = parse_alsa_hw_spec(want_id) else {
+        return false;
+    };
+    if d_prefix != w_prefix || d_dev != w_dev {
+        return false;
+    }
+    if d_card == w_card {
+        return true;
+    }
+    match (resolve_alsa_card_index(&d_card), resolve_alsa_card_index(&w_card)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_alsa_hw_spec(spec: &str) -> Option<(&str, String, u32)> {
+    let (prefix, rest) = spec.split_once(':')?;
+    if !matches!(prefix, "hw" | "plughw" | "sysdefault" | "front" | "iec958" | "hdmi") {
+        return None;
+    }
+    let mut card: Option<String> = None;
+    let mut dev: u32 = 0;
+    for (idx, part) in rest.split(',').enumerate() {
+        let part = part.trim();
+        if let Some(c) = part.strip_prefix("CARD=") {
+            card = Some(c.to_string());
+        } else if let Some(d) = part.strip_prefix("DEV=") {
+            dev = d.parse().ok()?;
+        } else if idx == 0 && !part.is_empty() {
+            card = Some(part.to_string());
+        } else if idx == 1 && !part.is_empty() {
+            dev = part.parse().ok()?;
+        }
+    }
+    Some((prefix, card?, dev))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_alsa_card_index(card_str: &str) -> Option<i32> {
+    if let Ok(idx) = card_str.parse::<i32>() {
+        return Some(idx);
+    }
+    for card in alsa::card::Iter::new().filter_map(std::result::Result::ok) {
+        let idx = card.get_index();
+        if let Ok(ctl) = alsa::Ctl::new(&format!("hw:{idx}"), false) {
+            if let Ok(info) = ctl.card_info() {
+                if info.get_id().ok() == Some(card_str) || info.get_name().ok() == Some(card_str) {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Names of all available output devices on the default host.
@@ -86,8 +159,22 @@ pub fn device_sample_rate_info(name: Option<&str>) -> Result<(u32, u32)> {
     if let Ok(ranges) = device.supported_output_configs() {
         for r in ranges {
             let hi = r.max_sample_rate() as u32;
+            // Ignore ALSA `plughw` synthetic u32::MAX (4294967295 Hz) if we can query the real `hw:` cap.
             if hi > max_sr {
                 max_sr = hi;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if max_sr > 768_000 {
+        if let Some(s) = name {
+            if let Some(rest) = s.trim().strip_prefix("plughw:") {
+                let hw_name = format!("hw:{rest}");
+                if let Ok((_, hw_max)) = device_sample_rate_info(Some(&hw_name)) {
+                    if hw_max <= 768_000 {
+                        max_sr = hw_max;
+                    }
+                }
             }
         }
     }
@@ -180,6 +267,9 @@ pub fn play_pulse(
 
     match sample_format {
         SampleFormat::F32 => run::<f32>(&device, config, f, amp, dur_secs, fade_ms, decay_s, show_progress),
+        SampleFormat::F64 => run::<f64>(&device, config, f, amp, dur_secs, fade_ms, decay_s, show_progress),
+        SampleFormat::I32 => run::<i32>(&device, config, f, amp, dur_secs, fade_ms, decay_s, show_progress),
+        SampleFormat::I24 => run::<cpal::I24>(&device, config, f, amp, dur_secs, fade_ms, decay_s, show_progress),
         SampleFormat::I16 => run::<i16>(&device, config, f, amp, dur_secs, fade_ms, decay_s, show_progress),
         SampleFormat::U16 => run::<u16>(&device, config, f, amp, dur_secs, fade_ms, decay_s, show_progress),
         other => bail!("unsupported sample format: {other:?}"),

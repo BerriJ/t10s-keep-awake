@@ -51,8 +51,27 @@ enum Command {
         #[arg(long)]
         device: Option<String>,
     },
-    /// Open the settings window directly (Windows) or print config info (Linux).
-    Settings,
+    /// Open the settings window directly (Windows) or configure/print config (Linux).
+    Settings {
+        /// Set the output device in config.toml (see `list-devices`).
+        #[arg(long)]
+        device: Option<String>,
+        /// Set the pulse interval in minutes (5..=16).
+        #[arg(long)]
+        interval: Option<f32>,
+        /// Enable or disable autostart (systemd user service on Linux, HKCU Run on Windows).
+        #[arg(long)]
+        autostart: Option<bool>,
+        /// Set the exclusive/requested sample rate in Hz (48000, 96000, 192000, 384000).
+        #[arg(long)]
+        rate: Option<u32>,
+        /// Set the output device volume percentage (0 = don't touch mixer; 1..=100 = pin volume).
+        #[arg(long)]
+        volume: Option<u8>,
+        /// Enable or disable the keep-awake engine.
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
     /// Play a calibration pulse (or repeat with --hold).
     Pulse(PulseArgs),
 }
@@ -172,8 +191,55 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Settings) => {
-            let cfg = Config::load_or_default()?;
+        Some(Command::Settings {
+            device,
+            interval,
+            autostart,
+            rate,
+            volume: vol_pct,
+            enabled,
+        }) => {
+            let mut cfg = Config::load_or_default()?;
+            let has_cli_edits = device.is_some()
+                || interval.is_some()
+                || autostart.is_some()
+                || rate.is_some()
+                || vol_pct.is_some()
+                || enabled.is_some();
+            if has_cli_edits {
+                if let Some(d) = device {
+                    cfg.output_device = d;
+                }
+                if let Some(i) = interval {
+                    cfg.interval_min = i;
+                }
+                if let Some(a) = autostart {
+                    cfg.autostart = a;
+                }
+                if let Some(r) = rate {
+                    cfg.sample_rate = r;
+                }
+                if let Some(v) = vol_pct {
+                    cfg.device_volume_pct = v;
+                }
+                if let Some(e) = enabled {
+                    cfg.enabled = e;
+                }
+                cfg.sanitize();
+                cfg.save()?;
+                let _ = autostart::set_enabled(cfg.autostart);
+                if !cfg.output_device.trim().is_empty() && cfg.device_volume_pct > 0 {
+                    let _ = volume::set_endpoint_volume_percent(
+                        &cfg.output_device,
+                        cfg.device_volume_pct,
+                    );
+                }
+                let path = Config::path()?;
+                println!("Updated config at {}:\n", path.display());
+                println!("{}", toml::to_string_pretty(&cfg)?);
+                return Ok(());
+            }
+
             #[cfg(windows)]
             {
                 // Standalone `settings` has no engine behind it, so its health handle notifies nobody.
@@ -188,7 +254,7 @@ fn main() -> Result<()> {
             {
                 let path = Config::path()?;
                 println!("Config file: {}", path.display());
-                println!("(Edit this file directly; changes are hot-reloaded within 2s while `run` is active.)\n");
+                println!("(Edit this file directly or pass flags like `settings --device \"...\"`; changes are hot-reloaded within 2s while `run` is active.)\n");
                 println!("{}", toml::to_string_pretty(&cfg)?);
             }
             Ok(())
@@ -256,7 +322,7 @@ fn run_app() -> Result<()> {
         tracing::info!(?cfg, "loaded config");
     }
 
-    if !cfg.output_device.trim().is_empty() {
+    if !cfg.output_device.trim().is_empty() && cfg.device_volume_pct > 0 {
         if let Err(e) = volume::set_endpoint_volume_percent(&cfg.output_device, cfg.device_volume_pct) {
             tracing::debug!(error = %format!("{e:#}"), "initial volume pin skipped");
         }
