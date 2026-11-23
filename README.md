@@ -44,6 +44,12 @@ isn't code-signed. Build it yourself if you'd rather not take that on trust.
 cargo build --release
 ```
 On Linux, `alsa-lib` (`libasound2-dev` / `alsa-lib-devel`) and `pkg-config` are required to build.
+On Nix / NixOS, you can build or run directly using the included flake:
+```
+nix build                  # builds ./result/bin/t10s_keep_awake
+nix run . -- list-devices  # build and run directly
+nix develop                # enter a dev shell with cargo, rustc, pkg-config, and alsa-lib
+```
 On Windows, release binaries link the CRT statically via `.cargo/config.toml`.
 
 ## Run
